@@ -1,0 +1,48 @@
+spring:
+  application:
+    name: xilian-ai
+  profiles:
+    active: local
+  mvc:
+    async:
+      request-timeout: 120000
+# 填写 PgVector 数据库信息
+#  datasource:
+#    url: xxx
+#    username: root
+#    password: 123456
+  ai:
+    dashscope:
+      # 需要替换为你自己的 key
+      api-key: sk-c3eb125b045644bfae281394980f1a3a
+      chat:
+        options:
+          model: qwen-plus
+          temperature: 0.5
+#          enable-thinking: true
+#    ollama:
+#      base-url: http://localhost:11434
+#      chat:
+#        model: gemma3:1b
+# 需要启动PgVector数据库
+#    vectorstore:
+#      pgvector:
+#        index-type: HNSW
+#        dimensions: 1536
+#        distance-type: COSINE_DISTANCE
+#        max-document-batch-size: 10000 # Optional: Maximum number of documents per batch
+server:
+  port: 8123
+  servlet:
+    context-path: /api
+# knife4j config
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn
+
+# 修改日志级别，查看 Spring AI 更多调用细节
+logging:
+  level:
+    org.springframework.ai: DEBUG
+
