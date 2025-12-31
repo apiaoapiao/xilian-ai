@@ -1,6 +1,6 @@
 package com.springai.xilianai.controller;
 
-import com.springai.xilianai.app.Client;
+import com.springai.xilianai.xlai.Client;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.MediaType;

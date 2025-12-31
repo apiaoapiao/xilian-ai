@@ -1,4 +1,4 @@
-package com.springai.xilianai.app;
+package com.springai.xilianai.xlai;
 
 import com.springai.xilianai.advisor.LoggerAdvisor;
 import com.springai.xilianai.chatmemory.FileBasedChatMemory;
