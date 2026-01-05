@@ -44,7 +44,7 @@ public class TtsController {
                 log.info("开始批量TTS合成，文本长度: {}", request.getText().length());
 
                 // 收集所有音频数据
-                byte[] audioData = ttsBinaryService.synthesizeBinary(request.getText())
+                byte[] audioData = ttsBinaryService.synthesizeBinary(request.getText(),request.getChatId())
                         .collectList()
                         .map(dataBuffers -> {
                             // 合并所有DataBuffer
@@ -88,6 +88,7 @@ public class TtsController {
     @Data
     public static class TtsRequest {
         private String text;
+        private String chatId;
         private String voiceModel = "default"; // 可选的语音模型
         private Double speed = 1.0; // 语速
     }

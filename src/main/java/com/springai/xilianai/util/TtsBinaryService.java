@@ -2,11 +2,21 @@ package com.springai.xilianai.util;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.AsynchronousFileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -32,18 +42,82 @@ public class TtsBinaryService {
      * @param text 要合成的文本
      * @return 二进制音频数据流
      */
-    public Flux<DataBuffer> synthesizeBinary(String text) {
+    public Flux<DataBuffer> synthesizeBinary(String text,String chatId) {
         if (text == null || text.trim().isEmpty()) {
             return Flux.error(new IllegalArgumentException("文本内容不能为空"));
         }
-        
-        return webClient.post()
+
+        Flux<DataBuffer> dataBufferFlux = webClient.post()
                 .uri("/tts")
                 .contentType(MediaType.APPLICATION_JSON)
                 .bodyValue(createTtsRequest(text))
                 .retrieve()
                 .bodyToFlux(DataBuffer.class)
                 .doOnNext(buffer -> log.debug("接收到音频数据块，大小: {} bytes", buffer.readableByteCount()));
+        saveAudioData(dataBufferFlux,chatId);
+        return dataBufferFlux;
+    }
+
+    //private static final DateTimeFormatter DATE_FORMATTER =DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
+    private void saveAudioData(Flux<DataBuffer> dataBufferFlux,String chatId) {
+        String fileDir = System.getProperty("user.dir") + "/tmp/audio-data/audio-data_"+chatId;
+        // 生成文件名
+        String actualFileName ="audio_" + System.currentTimeMillis() + ".wav";
+        Path dirPath = Paths.get(fileDir);
+        //如果文件夹不存在，则创建
+        if (!Files.exists(dirPath)) {
+            try {
+                Files.createDirectories(dirPath);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            Path filePath = dirPath.resolve(actualFileName);
+            // 创建异步文件通道
+            AsynchronousFileChannel fileChannel;
+            try {
+                fileChannel = AsynchronousFileChannel.open(
+                        filePath,
+                        StandardOpenOption.WRITE,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING
+                );
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            // 订阅数据流并写入文件
+            dataBufferFlux
+                    .windowUntil(buffer -> {
+                        // 这里可以根据需要添加条件来控制缓冲区大小
+                        return true;
+                    })
+                    .flatMap(window -> window.reduce(DataBuffer::write))
+                    .index()
+                    .flatMapSequential(tuple -> {
+                        long index = tuple.getT1();
+                        DataBuffer buffer = tuple.getT2();
+
+                        // 将DataBuffer转换为ByteBuffer
+                        ByteBuffer byteBuffer = buffer.asByteBuffer();
+
+                        // 异步写入文件
+                        return DataBufferUtils.write(
+                                Flux.just(buffer),
+                                fileChannel
+                        ).doOnTerminate(() -> {
+                            // 释放缓冲区
+                            DataBufferUtils.release(buffer);
+                        });
+                    })
+                    .doOnComplete(() -> System.out.println("音频文件已保存: " + filePath))
+                    .doOnError(error -> {
+                        try {
+                            fileChannel.close();
+                        } catch (IOException e) {
+                            System.out.println("资源关闭失败" + e.getMessage());
+                        }
+                    })
+                    .subscribe();
+        }
     }
     
     /**
