@@ -12,12 +12,20 @@ spring:
 #    username: root
 #    password: 123456
   ai:
-    dashscope:
-      # 需要替换为你自己的 key
-      api-key: ${alibailian_apikey}
+#    dashscope:
+#      # 需要替换为你自己的 key
+#      chat:
+#        options:
+#          model: qwen-plus
+#          temperature: 0.5
+#      api-key: ${DASHSCOPE_API_KEY}
+    deepseek:
+      # 不要把 key 写死在这里：本地放 application-local.yml（已 gitignore），或设置环境变量
+      api-key: ${DEEPSEEK_API_KEY}
+      base-url: https://api.deepseek.com
       chat:
         options:
-          model: qwen-plus
+          model: deepseek-flash
           temperature: 0.5
 #          enable-thinking: true
 #    ollama:
@@ -41,8 +49,39 @@ knife4j:
   setting:
     language: zh_cn
 
+# ---------- 语音合成（GPT-SoVITS）----------
+# 端口、参考音频路径等统一在这里维护，代码里不再写死
+tts:
+  # GPT-SoVITS 服务地址：端口按你本机部署改
+  base-url: http://127.0.0.1:9880
+  # 主参考音频：决定音色，换成你自己 GPT-SoVITS 里的音频
+  ref-audio-path: 'F:/GPT-SoVITS-v2pro-20250604/wav/【吃惊】这片麦田可是我们的宝贝，不能随便踩进去哦。会把希望踩坏的。.wav'
+  # 参考音频对应的文本，必须与音频内容一致
+  prompt-text: '这片麦田可是我们的宝贝，不能随便踩进去哦。会把希望踩坏的。'
+  # 辅助参考音频：用于情感融合，留空则不传该参数
+  aux-ref-audio-paths:
+    - 'F:/GPT-SoVITS-v2pro-20250604/wav/【开心】那时我们都是小孩子呢。.wav'
+    - 'F:/GPT-SoVITS-v2pro-20250604/wav/【恐惧】就像你的名字那样，背负起最初的混沌，和这个我们深爱的世界吧…….wav'
+    - 'F:/GPT-SoVITS-v2pro-20250604/wav/【难过】是呀。看着眼前的世界，悲伤的念头还是化作了现实…….wav'
+    - 'F:/GPT-SoVITS-v2pro-20250604/wav/【其他】（均匀的呼吸声）.wav'
+    - 'F:/GPT-SoVITS-v2pro-20250604/wav/【生气】嗯，毕竟…你可是我们的憧憬呀。.wav'
+  # 语言
+  text-lang: zh
+  prompt-lang: zh
+  # 推理参数
+  text-split-method: cut3
+  speed-factor: 1.0
+  temperature: 0.8
+  top-k: 10
+  top-p: 1.2
+  repetition-penalty: 1.35
+  sample-steps: 32
+  # 超时与排队
+  timeout: 120s
+  queue-wait: 180s
+  max-in-memory-size-mb: 32
+
 # 修改日志级别，查看 Spring AI 更多调用细节
 logging:
   level:
     org.springframework.ai: DEBUG
-

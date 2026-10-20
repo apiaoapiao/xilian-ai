@@ -1,5 +1,6 @@
 package com.springai.xilianai.tool;
 
+import com.springai.xilianai.config.TtsProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
@@ -18,20 +19,19 @@ public class TtsTool {
 
 
     private final RestTemplate restTemplate = new RestTemplate();
-    //调用tts的端口
-    private final String apiBaseUrl="http://127.0.0.1:9880";
-    //需要仓靠音频路径
-    private final String defaultRefAudioPath="";
 
-    private final String defaultTextLang="zh";
+    /** GPT-SoVITS 地址、参考音频等统一来自 application.yml 的 tts 配置 */
+    private final TtsProperties ttsProperties;
 
-    private final String defaultPromptLang="zh";
+    public TtsTool(TtsProperties ttsProperties) {
+        this.ttsProperties = ttsProperties;
+    }
 
     /**
      * 文本转语音 - 使用默认参数
      */
     public String textToSpeech(String text) {
-        return textToSpeech(text, defaultTextLang, defaultRefAudioPath, defaultPromptLang);
+        return textToSpeech(text, ttsProperties.getTextLang(), ttsProperties.getRefAudioPath(), ttsProperties.getPromptLang());
     }
 
     /**
@@ -68,7 +68,7 @@ public class TtsTool {
      * 调用GPT-SOVITS API的核心方法
      */
     private byte[] callGptSovitsApi(String text, String textLang, String refAudioPath, String promptLang) {
-        String apiUrl = apiBaseUrl + "/tts";
+        String apiUrl = ttsProperties.getBaseUrl() + "/tts";
 
         // 1. 设置请求头
         HttpHeaders headers = new HttpHeaders();

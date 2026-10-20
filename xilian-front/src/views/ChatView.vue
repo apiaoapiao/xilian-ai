@@ -1,757 +1,496 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
-import { useRouter, useRoute } from 'vue-router'
-import axios from 'axios'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import avatarUrl from '@/assets/xilianai.png'
+import { toErrorMessage } from '@/api/http'
+import ChatComposer from '@/components/ChatComposer.vue'
+import MessageBubble from '@/components/MessageBubble.vue'
+import SessionSidebar from '@/components/SessionSidebar.vue'
+import { useAudioPlayer } from '@/composables/useAudioPlayer'
+import { useChatStore } from '@/composables/useChatStore'
+import type { ChatMessage } from '@/types/chat'
 
-const router = useRouter()
 const route = useRoute()
+const router = useRouter()
+const {
+  conversations,
+  activeId,
+  activeMessages,
+  isStreaming,
+  isLoadingList,
+  listError,
+  historyError,
+  loadingChats,
+  ensureList,
+  refreshList,
+  activate,
+  createConversation,
+  sendMessage,
+  stopStreaming,
+  retry,
+  getSpeechUrl
+} = useChatStore()
+const { isPlaying, toggle: toggleAudio, stop: stopAudio } = useAudioPlayer()
 
-// 状态管理
-const chatId = ref<string>('')
-const message = ref('')
-// 为每个会话存储独立的消息列表
-const sessionMessages = ref<Map<string, Array<{ type: 'user' | 'ai'; content: string; audio?: string; audioLoading?: boolean }>>>(new Map())
-// 为每个会话存储最近5条语音的二进制数据
-const audioCache = ref<Map<string, Array<{ content: string; audio: Blob }>>>(new Map())
-const sessions = ref<Array<{ id: string; lastMessage: string; timestamp: Date }>>([])
+const drawerOpen = ref(false)
+const scrollerEl = ref<HTMLElement | null>(null)
+const pinned = ref(true)
 
-// 计算属性，获取当前会话的消息列表
-const messages = computed(() => {
-  return sessionMessages.value.get(chatId.value) || []
+const suggestions = ['今天过得怎么样呀？', '给我讲讲你的故事吧', '陪我聊聊天好吗？']
+
+const loadingHistory = computed(() => Boolean(loadingChats[activeId.value]))
+const isEmpty = computed(() => !loadingHistory.value && activeMessages.value.length === 0)
+
+/** 用「消息条数 + 末条内容长度」作为滚动信号，避免深度 watch 整个列表 */
+const scrollSignal = computed(() => {
+  const list = activeMessages.value
+  const last = list[list.length - 1]
+  return `${list.length}|${last?.content.length ?? 0}|${last?.status ?? ''}`
 })
 
-// 返回首页
-const goBack = () => {
-  router.push('/')
+function scrollToBottom(smooth = false): void {
+  const element = scrollerEl.value
+  if (!element) return
+  element.scrollTo({ top: element.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
+  pinned.value = true
 }
 
-// 生成会话ID
-const generateChatId = () => {
-  const randomId = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15)
-  return `xilian_${randomId}`
+function onScroll(): void {
+  const element = scrollerEl.value
+  if (!element) return
+  pinned.value = element.scrollHeight - element.scrollTop - element.clientHeight < 80
 }
 
-// 创建新对话
-const createNewConversation = () => {
-  const newChatId = generateChatId()
-  chatId.value = newChatId
-  sessionMessages.value.set(newChatId, [])
-  
-  // 添加到会话列表
-  sessions.value.unshift({
-    id: newChatId,
-    lastMessage: '',
-    timestamp: new Date()
-  })
-  
-  // 更新URL参数
-  router.push({ query: { chatId: newChatId } })
+// ---- 路由 <-> 会话同步 ----
+function readChatIdFromRoute(): string {
+  const raw = route.query.chatId
+  if (typeof raw === 'string') return raw
+  if (Array.isArray(raw)) return raw[0] ?? ''
+  return ''
 }
 
-// 切换会话
-const switchSession = async (sessionId: string) => {
-  chatId.value = sessionId
-  router.push({ query: { chatId: sessionId } })
-  
-  try {
-    // 调用后端接口获取历史对话
-    const response = await axios.get('http://localhost:8123/api/text/memory', {
-      params: { chatId: sessionId }
-    })
-    
-    // 获取当前会话的音频缓存
-    const sessionCache = audioCache.value.get(sessionId) || []
-    
-    // 将后端返回的消息格式转换为前端需要的格式，并恢复音频信息
-    const formattedMessages = response.data.map((msg: any) => {
-      const isAiMessage = msg.messageType === 'ASSISTANT'
-      const message: { type: 'user' | 'ai'; content: string; audio?: string; audioLoading?: boolean } = {
-        type: isAiMessage ? 'ai' : 'user',
-        content: msg.text,
-        audio: undefined,
-        audioLoading: false
-      }
-      
-      // 如果是AI消息，检查是否有对应的音频缓存
-      if (isAiMessage) {
-        const cachedAudio = sessionCache.find(item => item.content === msg.text)
-        if (cachedAudio) {
-          // 恢复音频URL
-          message.audio = URL.createObjectURL(cachedAudio.audio)
-        }
-      }
-      
-      return message
-    })
-    
-    // 更新会话消息列表
-    sessionMessages.value.set(sessionId, formattedMessages)
-    
-  } catch (error) {
-    console.error('获取历史对话失败:', error)
-    // 如果获取失败，确保当前会话有一个空的消息列表
-    if (!sessionMessages.value.has(sessionId)) {
-      sessionMessages.value.set(sessionId, [])
-    }
+async function syncFromRoute(replaceWhenMissing = false): Promise<void> {
+  const id = readChatIdFromRoute()
+  if (!id) {
+    const newId = createConversation()
+    const target = { path: '/chat', query: { chatId: newId } }
+    await (replaceWhenMissing ? router.replace(target) : router.push(target))
+    return
   }
+  await activate(id)
 }
 
-// 发送消息
-const sendMessage = async () => {
-  if (!message.value.trim()) return
-  
-  // 添加用户消息
-  const userMessage = message.value.trim()
-  // 确保当前会话有消息列表
-  if (!sessionMessages.value.has(chatId.value)) {
-    sessionMessages.value.set(chatId.value, [])
-  }
-  // 获取当前会话的消息列表
-  const currentMessages = sessionMessages.value.get(chatId.value) || []
-  currentMessages.push({ type: 'user', content: userMessage })
-  message.value = ''
-  
-  // 更新会话列表
-  const sessionIndex = sessions.value.findIndex(s => s.id === chatId.value)
-  if (sessionIndex !== -1) {
-    const session = sessions.value[sessionIndex]
-    if (session) {
-      session.lastMessage = userMessage
-      session.timestamp = new Date()
-    }
-  }
-  
-  try {
-    // 添加AI消息占位符
-    const currentMessages = sessionMessages.value.get(chatId.value) || []
-    const aiMessageIndex = currentMessages.length
-    currentMessages.push({ 
-      type: 'ai', 
-      content: '', 
-      audioLoading: true 
-    })
-    
-    // 调用流式对话接口
-    const response = await fetch(`http://localhost:8123/api/ai/chat/stream?message=${encodeURIComponent(userMessage)}&chatId=${chatId.value}`)
-    
-    if (!response.ok) {
-      throw new Error('Network response was not ok')
-    }
-    
-    // 获取可读流
-    const reader = response.body?.getReader()
-    if (!reader) {
-      throw new Error('No readable stream')
-    }
-    
-    const decoder = new TextDecoder('utf-8')
-    let accumulatedResponse = ''
-    
-    // 逐块读取数据
-    while (true) {
-      const { done, value } = await reader.read()
-      
-      if (done) {
-        break
-      }
-      
-      // 解码数据
-      const chunk = decoder.decode(value, { stream: true })
-      
-      // 处理每一行
-      const lines = chunk.split('\n')
-      for (const line of lines) {
-        if (line.trim() === '') continue
-        
-        // 去除 "data:" 前缀
-        let cleanedLine = line.trim()
-        if (cleanedLine.startsWith('data:')) {
-          cleanedLine = cleanedLine.substring(5).trim()
-        }
-        
-        // 累积响应
-        accumulatedResponse += cleanedLine
-        
-        // 更新UI - 使用Vue的响应式更新机制
-        const currentMessages = sessionMessages.value.get(chatId.value) || []
-        const originalMessage = currentMessages[aiMessageIndex]
-        if (originalMessage) {
-          currentMessages[aiMessageIndex] = { 
-            ...originalMessage, 
-            content: accumulatedResponse 
-          }
-          // 触发Vue的响应式更新
-          sessionMessages.value.set(chatId.value, [...currentMessages])
-        }
-      }
-    }
-    
-    // 调用TTS接口，确保去除前缀
-    await synthesizeAudio(accumulatedResponse, aiMessageIndex)
-    
-  } catch (error) {
-    console.error('对话失败:', error)
-    messages.value.push({ type: 'ai', content: '对不起，对话失败了，请稍后重试。' })
-  }
+async function startNewChat(): Promise<void> {
+  drawerOpen.value = false
+  const id = createConversation()
+  await router.push({ path: '/chat', query: { chatId: id } })
 }
 
-// 语音合成
-const synthesizeAudio = async (text: string, messageIndex: number) => {
-  try {
-    // 检查缓存中是否有相同内容的语音
-    const sessionCache = audioCache.value.get(chatId.value) || []
-    const cachedAudio = sessionCache.find(item => item.content === text)
-    
-    if (cachedAudio) {
-      // 使用缓存的音频数据
-      const audioUrl = URL.createObjectURL(cachedAudio.audio)
-      // 直接从sessionMessages获取消息列表并更新，确保Vue能检测到变化
-      const currentMessages = sessionMessages.value.get(chatId.value) || []
-      if (currentMessages[messageIndex]) {
-        currentMessages[messageIndex].audio = audioUrl
-        currentMessages[messageIndex].audioLoading = false
-        // 触发Vue的响应式更新
-        sessionMessages.value.set(chatId.value, [...currentMessages])
-      }
+async function selectConversation(id: string): Promise<void> {
+  drawerOpen.value = false
+  if (id === activeId.value) return
+  await router.push({ path: '/chat', query: { chatId: id } })
+}
+
+async function goHome(): Promise<void> {
+  stopAudio()
+  await router.push('/')
+}
+
+// ---- 交互 ----
+async function handleSend(text: string): Promise<void> {
+  // 极少数情况下（首屏 URL 里还没有 chatId）先不发送，避免建出「孤儿会话」
+  if (!activeId.value) return
+  await sendMessage(text)
+}
+
+async function handlePlay(message: ChatMessage): Promise<void> {
+  // 合成中重复点击直接忽略（同一个气泡只跑一个合成）
+  if (message.audioState === 'loading') return
+
+  if (isPlaying(message.id)) {
+    stopAudio()
+    return
+  }
+
+  let url = message.audioUrl
+  if (!url) {
+    message.audioState = 'loading'
+    message.audioError = ''
+    try {
+      url = await getSpeechUrl(message.content, activeId.value)
+      message.audioUrl = url
+      message.audioState = 'ready'
+    } catch (error) {
+      message.audioState = 'failed'
+      message.audioError = toErrorMessage(error) || '语音合成失败'
       return
     }
-    
-    // 调用TTS接口
-    const response = await axios.post('http://localhost:8123/api/tts/synthesize', 
-      { text },
-      { responseType: 'blob' }
-    )
-    
-    // 缓存音频数据
-    const audioBlob = response.data
-    const newCacheItem = { content: text, audio: audioBlob }
-    
-    // 限制每个会话最多缓存5条语音
-    const updatedCache = [newCacheItem, ...sessionCache].slice(0, 5)
-    audioCache.value.set(chatId.value, updatedCache)
-    
-    // 创建音频URL
-    const audioUrl = URL.createObjectURL(audioBlob)
-    // 直接从sessionMessages获取消息列表并更新，确保Vue能检测到变化
-    const currentMessages = sessionMessages.value.get(chatId.value) || []
-    if (currentMessages[messageIndex]) {
-      currentMessages[messageIndex].audio = audioUrl
-      currentMessages[messageIndex].audioLoading = false
-      // 触发Vue的响应式更新
-      sessionMessages.value.set(chatId.value, [...currentMessages])
-    }
-    
-  } catch (error) {
-    console.error('语音合成失败:', error)
-    // 直接从sessionMessages获取消息列表并更新，确保Vue能检测到变化
-    const currentMessages = sessionMessages.value.get(chatId.value) || []
-    if (currentMessages[messageIndex]) {
-      currentMessages[messageIndex].audioLoading = false
-      // 触发Vue的响应式更新
-      sessionMessages.value.set(chatId.value, [...currentMessages])
-    }
+  }
+
+  try {
+    await toggleAudio(message.id, url)
+    message.audioError = ''
+  } catch {
+    // 关键：播放失败（常见于合成耗时过长导致浏览器的用户手势过期）
+    // 不能丢掉已经合成好的音频，否则下一次点击又会重新合成一遍。
+    message.audioState = 'ready'
+    message.audioError = '浏览器拦截了自动播放，点一次即可播放'
   }
 }
 
-// 播放语音
-let currentAudio: HTMLAudioElement | null = null
-
-const playAudio = (audioUrl: string) => {
-  // 停止当前正在播放的语音
-  if (currentAudio) {
-    currentAudio.pause()
-    currentAudio.currentTime = 0
-  }
-  
-  // 创建新的音频对象并播放
-  currentAudio = new Audio(audioUrl)
-  currentAudio.play().catch(error => {
-    console.error('语音播放失败:', error)
-  })
+async function handleRetry(message: ChatMessage): Promise<void> {
+  await retry(activeId.value, message.id)
 }
 
-// 获取会话的最后一条消息和时间戳
-const getSessionInfo = async (sessionId: string) => {
-  try {
-    const response = await axios.get('http://localhost:8123/api/text/memory', {
-      params: { chatId: sessionId }
-    })
-    
-    const messages = response.data
-    if (messages && messages.length > 0) {
-      // 获取最后一条消息
-      const lastMessage = messages[messages.length - 1]
-      // 从文件名中解析时间戳（假设文件名格式为 xilian_时间戳_...）
-      const timestampMatch = sessionId.match(/xilian_(\d+)/)
-      const timestamp = timestampMatch && timestampMatch[1] ? new Date(parseInt(timestampMatch[1])) : new Date()
-      
-      return {
-        id: sessionId,
-        lastMessage: lastMessage.text || '新会话',
-        timestamp: timestamp
-      }
-    }
-  } catch (error) {
-    console.error(`获取会话 ${sessionId} 信息失败:`, error)
-  }
-  
-  // 默认值
-  return {
-    id: sessionId,
-    lastMessage: '新会话',
-    timestamp: new Date()
-  }
-}
+watch(scrollSignal, async () => {
+  await nextTick()
+  if (pinned.value) scrollToBottom()
+})
 
-// 组件挂载时初始化
-onMounted(async () => {
-  // 获取URL中的chatId，如果没有则生成新的
-  const urlChatId = route.query.chatId as string
-  chatId.value = urlChatId || generateChatId()
-  
-  try {
-    // 调用后端接口获取所有历史对话ID
-    const response = await axios.get('http://localhost:8123/api/text/filename')
-    const chatIds = response.data || []
-    
-    // 清空当前会话列表
-    sessions.value = []
-    
-    // 为每个聊天ID获取会话信息并添加到会话列表
-    for (const sessionId of chatIds) {
-      const sessionInfo = await getSessionInfo(sessionId)
-      sessions.value.push(sessionInfo)
-    }
-    
-    // 按时间戳排序，最新的会话排在前面
-    sessions.value.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
-    
-    // 确保当前会话也在列表中
-    if (chatId.value && !sessions.value.some(s => s.id === chatId.value)) {
-      const currentSessionInfo = await getSessionInfo(chatId.value)
-      sessions.value.unshift(currentSessionInfo)
-    }
-  } catch (error) {
-    console.error('获取历史对话ID列表失败:', error)
-    
-    // 如果获取失败，确保当前会话有一个空的消息列表
-    if (!sessionMessages.value.has(chatId.value)) {
-      sessionMessages.value.set(chatId.value, [])
-    }
-    
-    // 添加当前会话到会话列表
-    if (!sessions.value.some(s => s.id === chatId.value)) {
-      sessions.value.unshift({
-        id: chatId.value,
-        lastMessage: '',
-        timestamp: new Date()
-      })
-    }
+// 切换会话时重新贴底，避免停留在上一个会话的滚动位置
+watch(activeId, async () => {
+  pinned.value = true
+  await nextTick()
+  scrollToBottom()
+})
+
+watch(
+  () => route.query.chatId,
+  () => {
+    void syncFromRoute()
   }
-  
-  // 加载当前会话的历史消息
-  try {
-    const response = await axios.get('http://localhost:8123/api/text/memory', {
-      params: { chatId: chatId.value }
-    })
-    
-    // 获取当前会话的音频缓存
-    const sessionCache = audioCache.value.get(chatId.value) || []
-    
-    // 将后端返回的消息格式转换为前端需要的格式，并恢复音频信息
-    const formattedMessages = response.data.map((msg: any) => {
-      const isAiMessage = msg.messageType === 'ASSISTANT'
-      const message: { type: 'user' | 'ai'; content: string; audio?: string; audioLoading?: boolean } = {
-        type: isAiMessage ? 'ai' : 'user',
-        content: msg.text,
-        audio: undefined,
-        audioLoading: false
-      }
-      
-      // 如果是AI消息，检查是否有对应的音频缓存
-      if (isAiMessage) {
-        const cachedAudio = sessionCache.find(item => item.content === msg.text)
-        if (cachedAudio) {
-          // 恢复音频URL
-          message.audio = URL.createObjectURL(cachedAudio.audio)
-        }
-      }
-      
-      return message
-    })
-    
-    // 更新会话消息列表
-    sessionMessages.value.set(chatId.value, formattedMessages)
-    
-  } catch (error) {
-    console.error('获取当前会话历史对话失败:', error)
-    // 如果获取失败，确保当前会话有一个空的消息列表
-    if (!sessionMessages.value.has(chatId.value)) {
-      sessionMessages.value.set(chatId.value, [])
-    }
-  }
+)
+
+onMounted(() => {
+  void ensureList()
+  void syncFromRoute(true)
+  void nextTick(() => scrollToBottom())
 })
 </script>
 
 <template>
   <div class="chat-page">
-    <!-- 顶部导航栏 -->
-    <div class="chat-header">
-      <button class="back-button" @click="goBack">←</button>
-      <h1>昔涟</h1>
-      <div class="header-right"></div>
-    </div>
-    
-    <!-- 聊天内容区域 -->
-    <div class="chat-content">
-      <!-- 左侧会话列表 -->
-      <div class="session-list">
-        <div class="avatar">
-          <img src="/src/assets/xilianai.png" class="avatar-img" alt="昔涟AI">
-        </div>
-        <button class="new-conversation-btn" @click="createNewConversation">
-          开启新对话
+    <SessionSidebar
+      :conversations="conversations"
+      :active-id="activeId"
+      :loading="isLoadingList"
+      :error="listError"
+      :class="{ open: drawerOpen }"
+      @new-chat="startNewChat"
+      @select="selectConversation"
+      @refresh="refreshList"
+      @close="drawerOpen = false"
+    />
+
+    <div v-if="drawerOpen" class="backdrop" @click="drawerOpen = false"></div>
+
+    <section class="main">
+      <header class="topbar">
+        <button type="button" class="icon-btn" aria-label="返回首页" title="返回首页" @click="goHome">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M15 18 9 12l6-6" />
+          </svg>
         </button>
-        <div class="sessions">
-          <div 
-            v-for="session in sessions" 
-            :key="session.id"
-            class="session-item"
-            :class="{ active: session.id === chatId }"
-            @click="switchSession(session.id)"
-          >
-            <div class="session-message">{{ session.lastMessage || '新会话' }}</div>
-            <div class="session-time">{{ new Date(session.timestamp).toLocaleTimeString() }}</div>
+
+        <button type="button" class="icon-btn menu" aria-label="会话列表" @click="drawerOpen = true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" aria-hidden="true">
+            <path d="M4 7h16M4 12h16M4 17h16" />
+          </svg>
+        </button>
+
+        <h1 class="title">昔涟</h1>
+
+        <span class="status" :class="{ live: isStreaming }">
+          {{ isStreaming ? '正在回答…' : '记忆对话' }}
+        </span>
+      </header>
+
+      <div ref="scrollerEl" class="scroller" @scroll.passive="onScroll">
+        <div class="stream">
+          <p v-if="historyError" class="banner">
+            <span>{{ historyError }}</span>
+            <button type="button" @click="syncFromRoute()">重试</button>
+          </p>
+
+          <div v-if="loadingHistory" class="skeleton-list">
+            <div v-for="n in 3" :key="`m-skeleton-${n}`" class="bubble-skeleton" :class="{ right: n % 2 === 0 }"></div>
           </div>
-        </div>
-      </div>
-      
-      <!-- 右侧对话区域 -->
-      <div class="message-area">
-        <div class="messages">
-          <div 
-            v-for="(msg, index) in messages" 
-            :key="index"
-            class="message"
-            :class="msg.type"
-          >
-            <div class="message-content">{{ msg.content }}</div>
-            <div v-if="msg.type === 'ai'" class="message-audio">
-              <div v-if="msg.audioLoading" class="audio-progress">
-                <div class="progress-bar"></div>
-              </div>
-              <button 
-                v-else-if="msg.audio" 
-                class="play-button"
-                @click="playAudio(msg.audio)"
-                title="播放语音"
-              >
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M11 5L6 9H2v6h4l5 4V5z"></path>
-                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
-                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
-                </svg>
+
+          <div v-else-if="isEmpty" class="empty">
+            <img class="empty-avatar" :src="avatarUrl" alt="昔涟头像" />
+            <h2>在这里，记忆不会消散</h2>
+            <p>我是昔涟。今天想和我说些什么呢？</p>
+            <div class="chips">
+              <button v-for="item in suggestions" :key="item" type="button" class="chip" @click="handleSend(item)">
+                {{ item }}
               </button>
             </div>
           </div>
-        </div>
-        
-        <!-- 消息输入区域 -->
-        <div class="input-area">
-          <input 
-            type="text" 
-            v-model="message" 
-            placeholder="输入消息..."
-            @keyup.enter="sendMessage"
-          />
-          <button @click="sendMessage">发送</button>
+
+          <template v-else>
+            <MessageBubble
+              v-for="message in activeMessages"
+              :key="message.id"
+              :message="message"
+              :playing="isPlaying(message.id)"
+              @play="handlePlay(message)"
+              @retry="handleRetry(message)"
+            />
+          </template>
         </div>
       </div>
-    </div>
+
+      <button v-if="!pinned" type="button" class="to-bottom" aria-label="回到底部" @click="scrollToBottom(true)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 5v14" />
+          <path d="M19 12l-7 7-7-7" />
+        </svg>
+      </button>
+
+      <ChatComposer :streaming="isStreaming" @send="handleSend" @stop="stopStreaming" />
+    </section>
   </div>
 </template>
 
 <style scoped>
 .chat-page {
-  width: 100vw;
-  height: 100vh;
   display: flex;
-  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
   overflow: hidden;
+  background: var(--xl-bg);
 }
 
-/* 顶部导航栏 - 高度缩小 */
-.chat-header {
-  background-color: #ff69b4;
-  color: white;
-  padding: 10px 15px;
-  text-align: center;
-  font-size: 18px;
-  font-weight: bold;
+.main {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.topbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 56px;
+  padding: 0 12px;
+  background: rgba(255, 247, 251, 0.86);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--xl-border);
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: 10px;
+  background: none;
+  color: var(--xl-text-2);
+  transition: background-color 0.18s ease, color 0.18s ease;
+}
+
+.icon-btn:hover {
+  background: rgba(255, 111, 174, 0.12);
+  color: var(--xl-primary-dark);
+}
+
+.menu {
+  display: none;
+}
+
+.title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--xl-text);
+}
+
+.status {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: #b0628c;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(255, 111, 174, 0.14);
+}
+
+.status.live {
+  color: #fff;
+  background: var(--xl-primary);
+}
+
+.scroller {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scroll-behavior: auto;
+  position: relative;
+}
+
+.stream {
+  max-width: 820px;
+  min-height: 100%;
+  margin: 0 auto;
+  padding: 20px 18px 8px;
+  display: flex;
+  flex-direction: column;
+}
+
+.banner {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 50px;
-  box-sizing: border-box;
+  gap: 10px;
+  margin: 0 0 14px;
+  padding: 9px 12px;
+  border-radius: 12px;
+  background: #fff5f9;
+  border: 1px solid #f5c2d3;
+  font-size: 12.5px;
+  color: #d6437b;
 }
 
-.back-button {
-  background: none;
+.banner button {
   border: none;
-  color: white;
-  font-size: 20px;
-  cursor: pointer;
-  padding: 5px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
-  transition: background-color 0.2s;
+  background: none;
+  padding: 0;
+  font-size: 12.5px;
+  color: #d6437b;
+  text-decoration: underline;
 }
 
-.back-button:hover {
-  background-color: rgba(255, 255, 255, 0.2);
-}
-
-.header-right {
-  width: 30px;
-}
-
-.chat-header h1 {
-  margin: 0;
-  font-size: 18px;
-}
-
-.chat-content {
-  display: flex;
-  flex: 1;
-  overflow: hidden;
-}
-
-/* 会话列表样式 */
-.session-list {
-  width: 220px;
-  background-color: #f8f8f8;
-  border-right: 1px solid #ddd;
+.empty {
   display: flex;
   flex-direction: column;
+  align-items: center;
+  text-align: center;
+  margin: auto 0;
+  padding: 12px 8px 5vh;
 }
 
-.avatar {
-  padding: 15px;
-  display: flex;
-  justify-content: center;
-}
-
-.avatar-img {
-  width: 80px;
-  height: 80px;
+.empty-avatar {
+  width: 76px;
+  height: 76px;
   border-radius: 50%;
   object-fit: cover;
+  box-shadow: 0 10px 26px rgba(214, 121, 160, 0.32);
 }
 
-/* 新对话按钮样式 */
-.new-conversation-btn {
-  margin: 0 20px 15px;
-  padding: 10px;
-  background-color: #ff69b4;
-  color: white;
-  border: none;
-  border-radius: 20px;
-  cursor: pointer;
-  font-size: 14px;
-  transition: background-color 0.3s;
-  box-shadow: 0 2px 5px rgba(255, 105, 180, 0.3);
+.empty h2 {
+  margin: 16px 0 6px;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--xl-text);
 }
 
-.new-conversation-btn:hover {
-  background-color: #ff1493;
+.empty p {
+  margin: 0;
+  font-size: 13.5px;
+  color: var(--xl-text-3);
 }
 
-.sessions {
-  flex: 1;
-  overflow-y: auto;
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 20px;
 }
 
-.session-item {
-  padding: 15px;
-  border-bottom: 1px solid #eee;
-  cursor: pointer;
-  transition: background-color 0.2s;
+.chip {
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--xl-border);
+  background: var(--xl-surface);
+  font-size: 12.5px;
+  color: var(--xl-text-2);
+  box-shadow: var(--xl-shadow-sm);
+  transition: transform 0.18s ease, border-color 0.18s ease, color 0.18s ease;
 }
 
-.session-item:hover {
-  background-color: #e8e8e8;
+.chip:hover {
+  transform: translateY(-1px);
+  border-color: #ffc9df;
+  color: var(--xl-primary-dark);
 }
 
-.session-item.active {
-  background-color: #ffb6c1;
-}
-
-.session-message {
-  font-size: 14px;
-  margin-bottom: 5px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.session-time {
-  font-size: 12px;
-  color: #999;
-}
-
-/* 消息区域样式 */
-.message-area {
-  flex: 1;
+.skeleton-list {
   display: flex;
   flex-direction: column;
-  background-color: white;
-  overflow: hidden;
+  gap: 16px;
+  padding-top: 10px;
 }
 
-.messages {
-  flex: 1;
-  padding: 20px;
-  overflow-y: auto;
-  overflow-x: hidden;
-  text-align: left;
+.bubble-skeleton {
+  height: 54px;
+  width: min(70%, 460px);
+  border-radius: 16px;
+  background: linear-gradient(90deg, #f7e7ef, #fff, #f7e7ef);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite linear;
 }
 
-/* 输入区域样式 */
-.input-area {
-  padding: 20px;
-  border-top: 1px solid #ddd;
-  display: flex;
-  gap: 10px;
-  background-color: white;
+.bubble-skeleton.right {
+  align-self: flex-end;
+  background: linear-gradient(90deg, #ffe1ee, #fff2f8, #ffe1ee);
+  background-size: 200% 100%;
 }
 
-.message {
-  margin-bottom: 20px;
-  display: flex;
-  max-width: 70%;
+@keyframes shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
 }
 
-.message.user {
-  margin-left: auto;
-  justify-content: flex-end;
-}
-
-.message.ai {
-  margin-right: auto;
-  justify-content: flex-start;
-}
-
-.message-content {
-  padding: 10px 15px;
-  border-radius: 18px;
-  line-height: 1.4;
-  text-align: left;
-}
-
-.message.user .message-content {
-  background-color: #007bff;
-  color: white;
-  border-bottom-right-radius: 4px;
-}
-
-.message.ai .message-content {
-  background-color: #f0f0f0;
-  color: black;
-  border-bottom-left-radius: 4px;
-}
-
-/* 语音相关样式 */
-.message-audio {
-  margin-top: 5px;
-  padding: 0 15px;
-}
-
-.audio-progress {
-  width: 100px;
-  height: 4px;
-  background-color: #e0e0e0;
-  border-radius: 2px;
-  overflow: hidden;
-}
-
-.progress-bar {
-  height: 100%;
-  background-color: #ff69b4;
-  animation: progress 2s infinite;
-}
-
-@keyframes progress {
-  0% { width: 0%; }
-  50% { width: 50%; }
-  100% { width: 100%; }
-}
-
-.play-button {
-  background-color: #ff69b4;
-  color: white;
-  border: none;
-  border-radius: 50%;
-  cursor: pointer;
-  font-size: 14px;
-  padding: 10px;
-  display: flex;
+.to-bottom {
+  position: absolute;
+  right: 22px;
+  bottom: 104px;
+  z-index: 5;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  transition: background-color 0.3s, transform 0.2s;
-  box-shadow: 0 2px 5px rgba(255, 105, 180, 0.3);
-  width: 40px;
-  height: 40px;
-  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--xl-border);
+  border-radius: 50%;
+  background: var(--xl-surface);
+  color: var(--xl-text-2);
+  box-shadow: var(--xl-shadow-md);
 }
 
-.play-button:hover {
-  background-color: #ff1493;
-  transform: translateY(-1px);
-  box-shadow: 0 4px 8px rgba(255, 105, 180, 0.4);
+.to-bottom:hover {
+  color: var(--xl-primary-dark);
 }
 
-.play-button:active {
-  transform: translateY(0);
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: rgba(52, 26, 38, 0.32);
+  backdrop-filter: blur(1px);
 }
 
-.play-button svg {
-  width: 18px;
-  height: 18px;
-}
+@media (max-width: 860px) {
+  .menu {
+    display: inline-flex;
+  }
 
-
-/* 输入区域样式 */
-.input-area {
-  padding: 20px;
-  border-top: 1px solid #ddd;
-  display: flex;
-  gap: 10px;
-}
-
-.input-area input {
-  flex: 1;
-  padding: 10px 15px;
-  border: 1px solid #ddd;
-  border-radius: 20px;
-  font-size: 14px;
-}
-
-.input-area button {
-  padding: 10px 20px;
-  background-color: #ff69b4;
-  color: white;
-  border: none;
-  border-radius: 20px;
-  cursor: pointer;
-  font-size: 14px;
-  transition: background-color 0.3s;
-}
-
-.input-area button:hover {
-  background-color: #ff1493;
+  .stream {
+    padding: 14px 12px 4px;
+  }
 }
 </style>

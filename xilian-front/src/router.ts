@@ -1,6 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import WelcomeView from './views/WelcomeView.vue'
 import ChatView from './views/ChatView.vue'
+import WelcomeView from './views/WelcomeView.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -14,6 +14,10 @@ const router = createRouter({
       path: '/chat',
       name: 'chat',
       component: ChatView
+    },
+    {
+      path: '/:pathMatch(.*)*',
+      redirect: '/'
     }
   ]
 })

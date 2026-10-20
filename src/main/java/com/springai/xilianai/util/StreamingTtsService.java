@@ -1,5 +1,6 @@
 package com.springai.xilianai.util;
 
+import com.springai.xilianai.config.TtsProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferUtils;
@@ -20,14 +21,15 @@ public class StreamingTtsService {
     
     private final WebClient webClient;
     private final SentenceSegmenter segmenter;
-
-    private final String apiBaseUrl="http://127.0.0.1:9880";
+    private final TtsProperties ttsProperties;
     
-    public StreamingTtsService(SentenceSegmenter segmenter) {
+    public StreamingTtsService(SentenceSegmenter segmenter, TtsProperties ttsProperties) {
         this.segmenter = segmenter;
+        this.ttsProperties = ttsProperties;
         this.webClient = WebClient.builder()
-            .baseUrl(apiBaseUrl)
-            .codecs(configurer -> configurer.defaultCodecs().maxInMemorySize(10 * 1024 * 1024))
+            .baseUrl(ttsProperties.getBaseUrl())
+            .codecs(configurer -> configurer.defaultCodecs()
+                    .maxInMemorySize(ttsProperties.getMaxInMemorySizeMb() * 1024 * 1024))
             .build();
     }
 
@@ -64,10 +66,10 @@ public class StreamingTtsService {
     private Map<String, Object> createTtsRequest(String text) {
         Map<String, Object> request = new HashMap<>();
         request.put("text", text);
-        request.put("text_lang", "zh");
-        request.put("ref_audio_path", "F:/GPT-SoVITS-v2pro-20250604/wav/xilian.wav");
-        request.put("prompt_lang", "zh");
-        request.put("prompt_text", "这片麦田可是我们的宝贝，不能随便踩进去哦。会把希望踩坏的。");
+        request.put("text_lang", ttsProperties.getTextLang());
+        request.put("ref_audio_path", ttsProperties.getRefAudioPath());
+        request.put("prompt_lang", ttsProperties.getPromptLang());
+        request.put("prompt_text", ttsProperties.getPromptText());
         request.put("top_k", 5);
         request.put("top_p", 1);
         request.put("temperature", 1);
